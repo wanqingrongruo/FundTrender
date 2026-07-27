@@ -3,6 +3,7 @@ import SwiftData
 
 struct FundListView: View {
     @Environment(\.modelContext) private var modelContext
+    @Environment(\.accessibilityVoiceOverEnabled) private var isVoiceOverEnabled
     @StateObject private var vm = FundListViewModel()
     @State private var selectedCategory: FundCategory = .holding
 
@@ -58,14 +59,6 @@ struct FundListView: View {
             .sheet(isPresented: $vm.isAddingFund) {
                 AddFundView(vm: vm)
             }
-            .alert("错误", isPresented: Binding(
-                get: { vm.errorMessage != nil },
-                set: { if !$0 { vm.errorMessage = nil } }
-            )) {
-                Button("确定", role: .cancel) { vm.errorMessage = nil }
-            } message: {
-                Text(vm.errorMessage ?? "")
-            }
             .overlay {
                 if vm.isLoading {
                     ProgressView()
@@ -73,6 +66,30 @@ struct FundListView: View {
                         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
                 }
             }
+            .overlay(alignment: .top) {
+                if let message = vm.errorMessage {
+                    ErrorToastView(message: message) {
+                        withAnimation {
+                            vm.errorMessage = nil
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 8)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .task(id: message) {
+                        guard !isVoiceOverEnabled else { return }
+                        try? await Task.sleep(for: .seconds(3))
+                        guard !Task.isCancelled, vm.errorMessage == message else { return }
+                        withAnimation {
+                            vm.errorMessage = nil
+                        }
+                    }
+                    .onAppear {
+                        AccessibilityNotification.Announcement(message).post()
+                    }
+                }
+            }
+            .animation(.easeInOut(duration: 0.2), value: vm.errorMessage)
             .safeAreaInset(edge: .bottom) {
                 Picker("分类", selection: $selectedCategory) {
                     ForEach(FundCategory.allCases, id: \.self) { c in
@@ -86,5 +103,41 @@ struct FundListView: View {
             }
         }
         .onAppear { vm.setup(context: modelContext) }
+    }
+}
+
+private struct ErrorToastView: View {
+    let message: String
+    let dismiss: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+
+            Text(message)
+                .font(.subheadline)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            Button(action: dismiss) {
+                Image(systemName: "xmark")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("关闭提示")
+        }
+        .padding(.leading, 14)
+        .padding(.trailing, 8)
+        .padding(.vertical, 10)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(.orange.opacity(0.25))
+        }
+        .shadow(color: .black.opacity(0.12), radius: 8, y: 4)
+        .accessibilityElement(children: .contain)
     }
 }

@@ -2,6 +2,7 @@ import Foundation
 import SwiftUI
 import SwiftData
 import Combine
+import OSLog
 
 @MainActor
 class FundListViewModel: ObservableObject {
@@ -11,41 +12,142 @@ class FundListViewModel: ObservableObject {
     @Published var isAddingFund = false
 
     private var context: ModelContext?
+    private static let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "FundTrender",
+        category: "FundListViewModel"
+    )
 
     func setup(context: ModelContext) {
+        Self.logger.info("[FundList] setup context")
         self.context = context
         loadFunds()
     }
 
     func loadFunds() {
-        guard let context else { return }
+        guard let context else {
+            Self.logger.error("[FundList] load skipped: model context is nil")
+            return
+        }
         let descriptor = FetchDescriptor<FundEntity>(sortBy: [SortDescriptor(\.sortOrder)])
-        funds = (try? context.fetch(descriptor)) ?? []
+        do {
+            funds = try context.fetch(descriptor)
+            let codes = funds.map(\.code).joined(separator: ",")
+            Self.logger.debug("[FundList] loaded count=\(self.funds.count) codes=\(codes, privacy: .private)")
+        } catch {
+            funds = []
+            Self.logger.error("[FundList] load failed error=\(String(describing: error), privacy: .private)")
+        }
     }
 
     func refreshAll() async {
-        guard !funds.isEmpty else { return }
+        let refreshID = String(UUID().uuidString.prefix(8))
+        guard !isLoading else {
+            Self.logger.notice("[Refresh \(refreshID, privacy: .public)] skipped: another refresh is running")
+            return
+        }
+        guard !funds.isEmpty else {
+            Self.logger.notice("[Refresh \(refreshID, privacy: .public)] skipped: fund list is empty")
+            return
+        }
+        errorMessage = nil
+        let startedAt = Date()
+        let requestCount = funds.count
+        let requestedCodes = funds.map(\.code).joined(separator: ",")
+        Self.logger.notice(
+            "[Refresh \(refreshID, privacy: .public)] start count=\(requestCount) codes=\(requestedCodes, privacy: .private)"
+        )
         isLoading = true
-        defer { isLoading = false }
+        defer {
+            isLoading = false
+            let elapsed = Date().timeIntervalSince(startedAt)
+            Self.logger.notice(
+                "[Refresh \(refreshID, privacy: .public)] end elapsed=\(elapsed, format: .fixed(precision: 3))s"
+            )
+        }
 
-        await withTaskGroup(of: (String, FundQuote?).self) { group in
+        var successCount = 0
+        var failureCount = 0
+        var cancellationCount = 0
+        await withTaskGroup(of: (String, FundQuote?, String?, Bool).self) { group in
             for fund in funds {
                 let code = fund.code
                 group.addTask {
-                    (code, try? await FundAPIService.shared.fetchQuote(code: code))
+                    do {
+                        return (code, try await FundAPIService.shared.fetchQuote(code: code), nil, false)
+                    } catch is CancellationError {
+                        return (code, nil, nil, true)
+                    } catch let error as URLError where error.code == .cancelled {
+                        return (code, nil, nil, true)
+                    } catch {
+                        return (code, nil, String(describing: error), false)
+                    }
                 }
             }
-            for await (code, quote) in group {
-                guard let quote, let fund = funds.first(where: { $0.code == code }) else { continue }
+            for await (code, quote, errorDescription, wasCancelled) in group {
+                if wasCancelled {
+                    cancellationCount += 1
+                    continue
+                }
+                guard let quote else {
+                    failureCount += 1
+                    Self.logger.error(
+                        "[Refresh \(refreshID, privacy: .public)] quote failed code=\(code, privacy: .private) error=\(errorDescription ?? "unknown", privacy: .private)"
+                    )
+                    continue
+                }
+                guard let fund = funds.first(where: { $0.code == code }) else {
+                    failureCount += 1
+                    Self.logger.error(
+                        "[Refresh \(refreshID, privacy: .public)] result ignored: fund disappeared code=\(code, privacy: .private)"
+                    )
+                    continue
+                }
+
+                successCount += 1
+                let oldPreviousNav = fund.previousNav
+                let oldEstimate = fund.currentEstimate
+                let oldChangePercent = fund.changePercent
+                let newPreviousNav = Double(quote.dwjz) ?? 0
+                let newEstimate = Double(quote.gsz) ?? 0
+                let newChangePercent = Double(quote.gszzl) ?? 0
+                let valuesChanged = oldPreviousNav != newPreviousNav
+                    || oldEstimate != newEstimate
+                    || oldChangePercent != newChangePercent
+                Self.logger.debug(
+                    "[Refresh \(refreshID, privacy: .public)] apply code=\(code, privacy: .private) gztime=\(quote.gztime, privacy: .public) changed=\(valuesChanged) nav=\(oldPreviousNav, format: .fixed(precision: 4), privacy: .private)->\(newPreviousNav, format: .fixed(precision: 4), privacy: .private) estimate=\(oldEstimate, format: .fixed(precision: 4), privacy: .private)->\(newEstimate, format: .fixed(precision: 4), privacy: .private) percent=\(oldChangePercent, format: .fixed(precision: 2), privacy: .private)->\(newChangePercent, format: .fixed(precision: 2), privacy: .private)"
+                )
                 fund.prevPreviousNav = fund.previousNav  // 滚动保存，用于计算昨日涨跌幅
                 fund.name = quote.name
-                fund.previousNav = Double(quote.dwjz) ?? 0
-                fund.currentEstimate = Double(quote.gsz) ?? 0
-                fund.changePercent = Double(quote.gszzl) ?? 0
+                fund.previousNav = newPreviousNav
+                fund.currentEstimate = newEstimate
+                fund.changePercent = newChangePercent
                 fund.lastUpdated = Date()
             }
         }
-        try? context?.save()
+        guard !Task.isCancelled else {
+            Self.logger.notice(
+                "[Refresh \(refreshID, privacy: .public)] cancelled completed=\(successCount + failureCount) cancelled=\(cancellationCount)"
+            )
+            return
+        }
+        failureCount += cancellationCount
+        Self.logger.notice(
+            "[Refresh \(refreshID, privacy: .public)] requests finished success=\(successCount) failure=\(failureCount)"
+        )
+        if failureCount == requestCount {
+            errorMessage = "刷新失败，行情服务暂不可用，已保留上次数据"
+        } else if failureCount > 0 {
+            errorMessage = "部分基金刷新失败（\(failureCount)/\(requestCount)），成功数据已更新，其余保留上次数据"
+        }
+        do {
+            try context?.save()
+            Self.logger.info("[Refresh \(refreshID, privacy: .public)] model context saved")
+        } catch {
+            errorMessage = "刷新结果保存失败，请稍后重试"
+            Self.logger.error(
+                "[Refresh \(refreshID, privacy: .public)] model context save failed error=\(String(describing: error), privacy: .private)"
+            )
+        }
         loadFunds()
     }
 
