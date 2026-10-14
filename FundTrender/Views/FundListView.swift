@@ -21,7 +21,11 @@ struct FundListView: View {
                     List {
                         Section(header: FundListHeader().textCase(nil)) {
                             ForEach(filteredFunds) { fund in
-                                FundRowView(fund: fund)
+                                NavigationLink {
+                                    FundDetailView(fundCode: fund.code, fundName: fund.name)
+                                } label: {
+                                    FundRowView(fund: fund)
+                                }
                             }
                             .onDelete { indexSet in
                                 indexSet.forEach { vm.deleteFund(filteredFunds[$0]) }
