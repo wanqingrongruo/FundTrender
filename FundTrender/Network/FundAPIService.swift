@@ -5,12 +5,16 @@ enum FundAPIError: LocalizedError {
     case invalidCode
     case parseError
     case networkError(Error)
+    case httpError(Int)
+    case invalidResponse
 
     var errorDescription: String? {
         switch self {
         case .invalidCode: return "基金代码无效或不存在"
         case .parseError: return "数据解析失败"
         case .networkError(let e): return e.localizedDescription
+        case .httpError(let statusCode): return "行情服务异常（HTTP \(statusCode)），请稍后重试"
+        case .invalidResponse: return "行情服务返回了无效响应"
         }
     }
 }
@@ -60,7 +64,7 @@ struct FundAPIService {
             Self.logger.error(
                 "[Quote] non-HTTP response code=\(code, privacy: .private) elapsed=\(elapsed, format: .fixed(precision: 3))s response=\(String(describing: response), privacy: .private)"
             )
-            throw FundAPIError.invalidCode
+            throw FundAPIError.invalidResponse
         }
         let cacheControl = httpResponse.value(forHTTPHeaderField: "Cache-Control") ?? "-"
         let age = httpResponse.value(forHTTPHeaderField: "Age") ?? "-"
@@ -75,7 +79,7 @@ struct FundAPIService {
             Self.logger.error(
                 "[Quote] unexpected status code=\(code, privacy: .private) status=\(httpResponse.statusCode) body=\(bodyPreview, privacy: .private)"
             )
-            throw FundAPIError.invalidCode
+            throw FundAPIError.httpError(httpResponse.statusCode)
         }
         guard let text = String(data: data, encoding: .utf8) else {
             Self.logger.error("[Quote] invalid UTF-8 code=\(code, privacy: .private) bytes=\(data.count)")

@@ -6,6 +6,7 @@ struct FundListView: View {
     @Environment(\.accessibilityVoiceOverEnabled) private var isVoiceOverEnabled
     @StateObject private var vm = FundListViewModel()
     @State private var selectedCategory: FundCategory = .holding
+    @State private var isShowingRefreshFailures = false
 
     private var filteredFunds: [FundEntity] {
         vm.funds.filter { $0.category == selectedCategory.rawValue }
@@ -59,6 +60,22 @@ struct FundListView: View {
             .sheet(isPresented: $vm.isAddingFund) {
                 AddFundView(vm: vm)
             }
+            .sheet(isPresented: $isShowingRefreshFailures) {
+                FundRefreshFailuresView(failures: vm.refreshFailures)
+            }
+            .safeAreaInset(edge: .top) {
+                if !vm.refreshFailures.isEmpty {
+                    Button {
+                        isShowingRefreshFailures = true
+                    } label: {
+                        Label("查看失败详情（\(vm.refreshFailures.count)）", systemImage: "exclamationmark.triangle")
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .frame(minHeight: 44)
+                    }
+                    .padding(.horizontal)
+                    .background(.bar)
+                }
+            }
             .overlay {
                 if vm.isLoading {
                     ProgressView()
@@ -68,7 +85,10 @@ struct FundListView: View {
             }
             .overlay(alignment: .top) {
                 if let message = vm.errorMessage {
-                    ErrorToastView(message: message) {
+                    ErrorToastView(message: message, showDetails: vm.refreshFailures.isEmpty ? nil : {
+                        vm.errorMessage = nil
+                        isShowingRefreshFailures = true
+                    }) {
                         withAnimation {
                             vm.errorMessage = nil
                         }
@@ -108,6 +128,7 @@ struct FundListView: View {
 
 private struct ErrorToastView: View {
     let message: String
+    let showDetails: (() -> Void)?
     let dismiss: () -> Void
 
     var body: some View {
@@ -115,9 +136,18 @@ private struct ErrorToastView: View {
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(.orange)
 
-            Text(message)
-                .font(.subheadline)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            VStack(alignment: .leading, spacing: 8) {
+                Text(message)
+                    .font(.subheadline)
+
+                if let showDetails {
+                    Button("查看失败详情", action: showDetails)
+                        .frame(minHeight: 44)
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.tint)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
 
             Button(action: dismiss) {
                 Image(systemName: "xmark")

@@ -9,6 +9,7 @@ class FundListViewModel: ObservableObject {
     @Published var funds: [FundEntity] = []
     @Published var isLoading = false
     @Published var errorMessage: String?
+    @Published private(set) var refreshFailures: [FundRefreshFailure] = []
     @Published var isAddingFund = false
 
     private var context: ModelContext?
@@ -50,9 +51,11 @@ class FundListViewModel: ObservableObject {
             return
         }
         errorMessage = nil
+        refreshFailures = []
         let startedAt = Date()
-        let requestCount = funds.count
-        let requestedCodes = funds.map(\.code).joined(separator: ",")
+        let requestedFunds = funds.map { (code: $0.code, name: $0.name) }
+        let requestCount = requestedFunds.count
+        let requestedCodes = requestedFunds.map(\.code).joined(separator: ",")
         Self.logger.notice(
             "[Refresh \(refreshID, privacy: .public)] start count=\(requestCount) codes=\(requestedCodes, privacy: .private)"
         )
@@ -66,37 +69,40 @@ class FundListViewModel: ObservableObject {
         }
 
         var successCount = 0
-        var failureCount = 0
+        var failureReasons: [Int: String] = [:]
         var cancellationCount = 0
-        await withTaskGroup(of: (String, FundQuote?, String?, Bool).self) { group in
-            for fund in funds {
+        await withTaskGroup(of: (Int, FundQuote?, String?, Bool).self) { group in
+            for (index, fund) in requestedFunds.enumerated() {
                 let code = fund.code
                 group.addTask {
                     do {
-                        return (code, try await FundAPIService.shared.fetchQuote(code: code), nil, false)
+                        return (index, try await FundAPIService.shared.fetchQuote(code: code), nil, false)
                     } catch is CancellationError {
-                        return (code, nil, nil, true)
+                        return (index, nil, nil, true)
                     } catch let error as URLError where error.code == .cancelled {
-                        return (code, nil, nil, true)
+                        return (index, nil, nil, true)
                     } catch {
-                        return (code, nil, String(describing: error), false)
+                        let reason = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                        return (index, nil, reason, false)
                     }
                 }
             }
-            for await (code, quote, errorDescription, wasCancelled) in group {
+            for await (index, quote, errorDescription, wasCancelled) in group {
+                let code = requestedFunds[index].code
                 if wasCancelled {
                     cancellationCount += 1
+                    failureReasons[index] = "请求已取消，请重试"
                     continue
                 }
                 guard let quote else {
-                    failureCount += 1
+                    failureReasons[index] = errorDescription ?? "未知错误，请稍后重试"
                     Self.logger.error(
                         "[Refresh \(refreshID, privacy: .public)] quote failed code=\(code, privacy: .private) error=\(errorDescription ?? "unknown", privacy: .private)"
                     )
                     continue
                 }
                 guard let fund = funds.first(where: { $0.code == code }) else {
-                    failureCount += 1
+                    failureReasons[index] = "基金已从列表移除，本次结果未保存"
                     Self.logger.error(
                         "[Refresh \(refreshID, privacy: .public)] result ignored: fund disappeared code=\(code, privacy: .private)"
                     )
@@ -126,11 +132,15 @@ class FundListViewModel: ObservableObject {
         }
         guard !Task.isCancelled else {
             Self.logger.notice(
-                "[Refresh \(refreshID, privacy: .public)] cancelled completed=\(successCount + failureCount) cancelled=\(cancellationCount)"
+                "[Refresh \(refreshID, privacy: .public)] cancelled completed=\(successCount + failureReasons.count - cancellationCount) cancelled=\(cancellationCount)"
             )
             return
         }
-        failureCount += cancellationCount
+        refreshFailures = requestedFunds.enumerated().compactMap { index, fund in
+            guard let reason = failureReasons[index] else { return nil }
+            return FundRefreshFailure(code: fund.code, name: fund.name, reason: reason)
+        }
+        let failureCount = refreshFailures.count
         Self.logger.notice(
             "[Refresh \(refreshID, privacy: .public)] requests finished success=\(successCount) failure=\(failureCount)"
         )
